@@ -9,16 +9,17 @@ jobs:
     steps:
       - name: Скачать код
         uses: actions/checkout@v4
-  - name: Установить Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: '3.13'
 
-  - name: Установить библиотеки
-    run: pip install -r requirements.txt
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
 
-  - name: Проверить код бота
-    run: python -m py_compile bot.py
+      - name: Установить библиотеки
+        run: pip install -r requirements.txt
 
-  - name: Проверить соединение с Telegram
-    run: curl -I --max-time 15 https://api.telegram.org
+      - name: Проверить код бота
+        run: python -m py_compile bot.py
+
+      - name: Проверить соединение с Telegram
+        run: curl -I --max-time 15 https://api.telegram.org
