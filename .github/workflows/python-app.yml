@@ -1,3 +1,14 @@
+name: Проверка Telegram-бота
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачать код
+        uses: actions/checkout@v4
   - name: Установить Python
     uses: actions/setup-python@v5
     with:
