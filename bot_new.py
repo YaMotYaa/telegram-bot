@@ -59,15 +59,13 @@ def register_user(user, inviter=None):
         if existing:
             con.execute('UPDATE users SET name=?, username=? WHERE id=?',
                         (user.full_name, user.username, uid))
-            return
+            return None
         valid_inviter = inviter if inviter and inviter != uid and con.execute(
             'SELECT 1 FROM users WHERE id=?', (inviter,)).fetchone() else None
         con.execute('INSERT INTO users(id,name,username,invited_by,joined_at) VALUES (?,?,?,?,?)',
                     (uid, user.full_name, user.username, valid_inviter,
                      datetime.now(timezone.utc).isoformat()))
-        if valid_inviter:
-            con.execute('UPDATE users SET referrals=referrals+1, discount=1 WHERE id=?',
-                        (valid_inviter,))
+        return valid_inviter
 
 
 def admin_menu():
@@ -125,7 +123,7 @@ def product_buttons(p, admin):
     pid = p['id']
     back = f"manage:{p['category_id']}" if admin else f"category:{p['category_id']}"
     if not admin:
-        return keyboard([('⬅️ Назад', back)])
+        return keyboard(([('🛒 Купить товар', f'buy:{pid}')] if p['quantity'] > 0 else []) + [('⬅️ Назад', back)])
     return keyboard([('📝 Изменить описание', f'desc:{pid}'),
                      ('📷 Добавить / заменить фото', f'photo:{pid}'),
                      ('🗑 Удалить фото', f'removephoto:{pid}'),
@@ -135,10 +133,12 @@ def product_buttons(p, admin):
 
 
 def product_caption(p):
-    return (f"{p['name']}\n"
-            f"{'В наличии' if p['quantity'] else 'Нет в наличии'}\n"
-            f"Количество: {p['quantity']} шт.\n\n"
-            f"Описание: {p['description'] or 'Не добавлено'}")
+    result = (f"{p['name']}\n"
+              f"{'В наличии' if p['quantity'] else 'Нет в наличии'}\n"
+              f"Количество: {p['quantity']} шт.")
+    if p['description'] and p['description'].strip():
+        result += f"\n\nОписание: {p['description']}"
+    return result
 
 
 async def show_product(c, p, admin):
@@ -182,7 +182,16 @@ async def start(m: Message):
             pass
     if is_banned(m.from_user.id):
         return await m.answer('Доступ к боту ограничен.')
-    register_user(m.from_user, inviter)
+    new_inviter = register_user(m.from_user, inviter)
+    if new_inviter:
+        name = html.escape(m.from_user.full_name)
+        for recipient, msg in (
+            (ADMIN_ID, f'🔗 {name} (ID {m.from_user.id}) вошёл по ссылке пользователя {new_inviter}. Покупка пока не подтверждена, награды нет.'),
+            (new_inviter, f'👋 По вашей ссылке вошёл {name}. Покупка пока не подтверждена. Скидка и балл будут начислены только после подтверждения покупки.')):
+            try:
+                await m.bot.send_message(recipient, msg)
+            except Exception:
+                logging.exception('Не удалось отправить уведомление о приглашении')
     await m.answer('Добро пожаловать! Выберите раздел:', reply_markup=home())
 
 @DP.message(Command('id'))
@@ -210,6 +219,20 @@ async def callback(c: CallbackQuery):
             con.execute('DELETE FROM pending WHERE user_id=?', (uid,))
     if data == 'home':
         await c.message.edit_text('Главное меню:', reply_markup=home())
+    elif data.startswith('buy:'):
+        pid = int(data.split(':')[1])
+        with db() as con:
+            product = con.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
+            active = con.execute("SELECT id FROM purchases WHERE user_id=? AND status='pending'", (uid,)).fetchone()
+            if not product or product['quantity'] <= 0:
+                return await c.answer('Товара нет в наличии', show_alert=True)
+            if active:
+                return await c.answer('У вас уже есть заявка на покупку', show_alert=True)
+            cur = con.execute('INSERT INTO purchases(user_id,created_at) VALUES (?,?)', (uid, datetime.now(timezone.utc).isoformat()))
+            oid = cur.lastrowid
+            con.execute('INSERT INTO purchase_items(purchase_id,product_id,product_name,quantity) VALUES (?,?,?,1)', (oid,pid,product['name']))
+        await c.message.answer(f'🛒 Заявка #{oid} на товар «{product["name"]}» создана. Ожидайте подтверждения администратора.')
+        await c.bot.send_message(ADMIN_ID, f'🛒 Новая заявка #{oid}: {product["name"]} × 1 от пользователя {uid}\nПодтвердить после оплаты: /confirm {oid}\nОтклонить: /reject {oid}')
     elif data == 'catalog':
         await c.message.edit_text('📦 Выберите категорию:', reply_markup=categories())
     elif data == 'admin':
@@ -321,7 +344,7 @@ async def callback(c: CallbackQuery):
         me = await c.bot.get_me()
         link = f'https://t.me/{me.username}?start=ref_{uid}'
         await c.message.edit_text('💌 Ваша персональная ссылка для приглашения друзей:\n' + link +
-                               '\n\nЗа каждого нового приглашённого друга предоставляется скидка 10% на обычные товары. '
+                               '\n\nСкидка 10% начисляется только после подтверждённой покупки приглашённого друга. '
                                'Скидка не суммируется и списывается только после подтверждения покупки. За каждого приглашённого друга с подтверждённой покупкой начисляется 1 балл.',
                                reply_markup=keyboard([('⬅️ Назад', 'profile')]))
     elif data == 'redeem':
@@ -441,6 +464,7 @@ async def order_action(m: Message):
     except (IndexError, ValueError):
         return await m.answer('Укажи номер заявки.')
     confirmed = (m.text or '').split()[0].split('@')[0] == '/confirm'
+    rewarded_inviter = None
     with db() as con:
         order = con.execute("SELECT * FROM purchases WHERE id=? AND status='pending'", (oid,)).fetchone()
         if not order:
@@ -454,9 +478,16 @@ async def order_action(m: Message):
             if inviter and inviter['invited_by']:
                 inserted = con.execute('INSERT OR IGNORE INTO referral_rewards(invited_id,inviter_id,purchase_id) VALUES (?,?,?)', (uid,inviter['invited_by'],oid)).rowcount
                 if inserted:
-                    con.execute('UPDATE users SET points=points+1,earned_points=earned_points+1 WHERE id=?', (inviter['invited_by'],))
+                    con.execute('UPDATE users SET points=points+1,earned_points=earned_points+1,referrals=referrals+1,discount=1 WHERE id=?', (inviter['invited_by'],))
+                    rewarded_inviter = inviter['invited_by']
             con.execute('UPDATE users SET discount=0 WHERE id=?', (uid,))
             con.execute('DELETE FROM promo_uses WHERE user_id=?', (uid,))
+    if rewarded_inviter:
+        for recipient, notice in ((ADMIN_ID, f'🎉 Реферальная покупка #{oid} подтверждена! Пользователь {uid} купил товар. Пригласившему {rewarded_inviter} начислены 10% скидки и 1 балл.'), (rewarded_inviter, f'🎉 Ваш приглашённый друг совершил подтверждённую покупку #{oid}! Вам начислены 10% скидки и 1 балл.')):
+            try:
+                await m.bot.send_message(recipient, notice)
+            except Exception:
+                logging.exception('Не удалось уведомить о реферальной награде')
     await m.answer('✅ Покупка подтверждена, скидка списана.' if confirmed else '❌ Заявка отклонена, скидка сохранена.')
     try:
         await m.bot.send_message(uid, '🎉 Покупка подтверждена! Использованная скидка списана.' if confirmed else 'Заявка отклонена. Скидка сохранена.')
