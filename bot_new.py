@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / 'bot_data.sqlite3'
@@ -28,6 +28,7 @@ def init():
         con.execute('CREATE TABLE IF NOT EXISTS pending (user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, category_id INTEGER)')
         con.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, username TEXT, invited_by INTEGER, referrals INTEGER NOT NULL DEFAULT 0, discount INTEGER NOT NULL DEFAULT 0, joined_at TEXT NOT NULL)')
         con.execute('CREATE TABLE IF NOT EXISTS promocodes (code TEXT PRIMARY KEY, uses_left INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1)')
+        con.execute('CREATE TABLE IF NOT EXISTS promo_history (user_id INTEGER NOT NULL, code TEXT NOT NULL, PRIMARY KEY(user_id,code))')
         con.execute('CREATE TABLE IF NOT EXISTS promo_uses (user_id INTEGER, code TEXT, PRIMARY KEY(user_id,code))')
         con.execute('DELETE FROM promo_uses WHERE rowid NOT IN (SELECT MIN(rowid) FROM promo_uses GROUP BY user_id)')
         con.execute('CREATE UNIQUE INDEX IF NOT EXISTS one_promo_per_user ON promo_uses(user_id)')
@@ -81,13 +82,13 @@ def profile_text(uid):
         u = con.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
         promos = con.execute('SELECT COUNT(*) AS n FROM promo_uses WHERE user_id=?', (uid,)).fetchone()['n']
     if not u:
-        return 'Профиль пока не создан. Нажми /start.'
-    return (f"👤 Ваш профиль\\n\\n"
-            f"Имя: {html.escape(u['name'] or 'Не указано')}\\n"
-            f"Telegram ID: {uid}\\n"
-            f"Приглашено друзей: {u['referrals']}\\n"
-            f"Реферальная скидка: {'10%' if u['discount'] else 'нет'}\\n"
-            f"Активный промокод: {'есть' if promos else 'нет'}\\n"
+        return 'Профиль пока не создан. Отправьте команду /start.'
+    return (f"👤 Ваш профиль\n\n"
+            f"Имя: {html.escape(u['name'] or 'Не указано')}\n"
+            f"Идентификатор: {uid}\n"
+            f"Приглашено друзей: {u['referrals']}\n"
+            f"Реферальная скидка: {'10%' if u['discount'] else 'нет'}\n"
+            f"Активный промокод: {'есть' if promos else 'нет'}\n"
             f"Максимальная скидка: 10%.")
 
 
@@ -110,9 +111,9 @@ def product_buttons(p, admin):
 
 
 def product_caption(p):
-    return (f"{p['name']}\\n"
-            f"{'В наличии' if p['quantity'] else 'Нет в наличии'}\\n"
-            f"Количество: {p['quantity']} шт.\\n\\n"
+    return (f"{p['name']}\n"
+            f"{'В наличии' if p['quantity'] else 'Нет в наличии'}\n"
+            f"Количество: {p['quantity']} шт.\n\n"
             f"Описание: {p['description'] or 'Не добавлено'}")
 
 
@@ -124,7 +125,7 @@ async def show_product(c, p, admin):
 
 
 def home():
-    return keyboard([('📦 Каталог', 'catalog'), ('👤 Профиль', 'profile'), ('💬 Поддержка', 'support'), ('ℹ️ Информация', 'info')])
+    return keyboard([('📦 Каталог', 'catalog'), ('👤 Профиль', 'profile'), ('🧾 Мои покупки', 'mypurchases'), ('💬 Поддержка', 'support'), ('ℹ️ Информация', 'info')])
 
 def categories(admin=False):
     with db() as con:
@@ -232,16 +233,16 @@ async def callback(c: CallbackQuery):
         if p:
             await show_product(c, p, True)
     elif data == 'adminbans':
-        await c.message.edit_text('🚫 Управление доступом\\n\\n'
-                                  'Заблокировать: /ban ID\\n'
-                                  'Разблокировать: /unban ID\\n'
-                                  'Проверить: /banstatus ID',
+        await c.message.edit_text('🚫 Управление доступом\n\n'
+                                  'Заблокировать пользователя: /ban 123456789\n'
+                                  'Разблокировать пользователя: /unban 123456789\n'
+                                  'Проверить блокировку: /banstatus 123456789',
                                   reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data.startswith('setqty:'):
         pid = int(data.split(':')[1])
         with db() as con:
             con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, ?)', (uid, 'quantity', pid))
-        await c.message.edit_text('Введи количество (0 = нет в наличии). Отмена: /cancel')
+        await c.message.edit_text('Укажите количество товара. Если товара нет в наличии, введите 0. Для отмены отправьте /cancel.')
     elif data.startswith('delproduct:'):
         pid = int(data.split(':')[1])
         with db() as con:
@@ -257,29 +258,37 @@ async def callback(c: CallbackQuery):
         await c.message.edit_text('✅ Категория и её товары удалены.', reply_markup=categories(True))
     elif data == 'profile':
         await c.message.edit_text(profile_text(uid), reply_markup=profile_keyboard())
+    elif data == 'mypurchases':
+        with db() as con:
+            rows = con.execute('SELECT id,status,created_at FROM purchases WHERE user_id=? ORDER BY id DESC LIMIT 20', (uid,)).fetchall()
+        statuses = {'pending':'Ожидает подтверждения', 'confirmed':'Подтверждена', 'rejected':'Отклонена'}
+        msg = '🧾 Мои покупки\n\n'
+        msg += ('\n\n'.join(f"Заявка №{r['id']}\nСтатус: {statuses.get(r['status'],r['status'])}\nДата: {r['created_at'][:10]}" for r in rows) if rows else 'Пока нет заявок на покупки.')
+        await c.message.edit_text(msg, reply_markup=keyboard([('⬅️ Назад', 'home')]))
     elif data == 'referral':
         me = await c.bot.get_me()
         link = f'https://t.me/{me.username}?start=ref_{uid}'
-        await c.message.edit_text('💌 Твоя личная ссылка для друзей:\n' + link +
-                               '\n\nЗа каждого нового друга — скидка 10% на обычные товары. '
+        await c.message.edit_text('💌 Ваша персональная ссылка для приглашения друзей:\n' + link +
+                               '\n\nЗа каждого нового приглашённого друга предоставляется скидка 10% на обычные товары. '
                                'Скидка не суммируется и списывается только после подтверждения покупки.',
                                reply_markup=keyboard([('⬅️ Назад', 'profile')]))
     elif data == 'redeem':
         with db() as con:
             con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, NULL)', (uid, 'redeem'))
-        await c.message.edit_text('Введите промокод одним сообщением.', reply_markup=keyboard([('⬅️ Назад', 'profile')]))
+        await c.message.edit_text('Введите промокод одним сообщением. Промокод может содержать латинские буквы и цифры.', reply_markup=keyboard([('⬅️ Назад', 'profile')]))
     elif data == 'adminpromos':
-        await c.message.edit_text('🎟 Создать промокод: /newpromo КОД КОЛИЧЕСТВО\n'
+        await c.message.edit_text('🎟 Создать одноразовый промокод: /newpromo\n'
+                               'Создать промокод с выбранным названием: /newpromo КОД 1\n'
                                'Отключить: /delpromo КОД\n'
-                               'Промокод даёт скидку 10% на обычные товары.', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
+                               'Промокод даёт скидку 10% на обычные товары.\nОдин активный код на пользователя.', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data == 'admindiscounts':
-        await c.message.edit_text('👥 Проверить скидку: /discount ID\n'
-                               'Удалить скидку: /cleardiscount ID', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
+        await c.message.edit_text('👥 Проверить скидку: /discount 123456789\n'
+                               'Удалить скидку: /cleardiscount 123456789', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data == 'adminorders':
         with db() as con:
             orders = con.execute("SELECT id,user_id FROM purchases WHERE status='pending' ORDER BY id DESC LIMIT 15").fetchall()
         msg = '🧾 Ожидают подтверждения:\n' + ('\n'.join(f"#{o['id']} — пользователь {o['user_id']}" for o in orders) if orders else 'Пока пусто')
-        await c.message.edit_text(msg + '\n\nПодтвердить: /confirm НОМЕР\nОтменить: /reject НОМЕР', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
+        await c.message.edit_text(msg + '\n\nПодтвердить заявку: /confirm НОМЕР\nОтклонить заявку: /reject НОМЕР', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data == 'support':
         await c.message.edit_text('💬 Поддержка\n\nПо вопросам работы каталога и наличия товаров обращайтесь к администратору: @nikotinmal.\n\nМы ответим на ваше сообщение при первой возможности.', reply_markup=keyboard([('⬅️ Назад', 'home')]))
     elif data == 'info':
@@ -303,15 +312,15 @@ async def newpromo(m: Message):
     elif len(args) == 3 and re.fullmatch(r'[A-Za-z0-9_-]{3,24}', args[1]) and args[2].isdigit() and 1 <= int(args[2]) <= 100000:
         code, uses = args[1].upper(), int(args[2])
     else:
-        return await m.answer('Создать один уникальный промокод: /newpromo\\nИли: /newpromo КОД 1')
+        return await m.answer('Создать один уникальный промокод: /newpromo\nИли: /newpromo КОД 1')
     with db() as con:
         existing = con.execute('SELECT 1 FROM promocodes WHERE code=?', (code,)).fetchone()
         if existing:
             return await m.answer('Такой код уже существует. Выберите другой.')
         con.execute('INSERT INTO promocodes(code,uses_left,active) VALUES (?,?,1)', (code, uses))
-    await m.answer('Промокод создан. Нажмите на код, чтобы скопировать:\\n'
-                   f'<code>{html.escape(code)}</code>\\n'
-                   f'Активаций: {uses}\\nСкидка: 10%.',
+    await m.answer('Промокод создан. Нажмите на код, чтобы скопировать:\n'
+                   f'<code>{html.escape(code)}</code>\n'
+                   f'Активаций: {uses}\nСкидка: 10%.',
                    parse_mode='HTML')
 
 
@@ -321,7 +330,7 @@ async def delpromo(m: Message):
         return
     args = (m.text or '').split()
     if len(args) != 2:
-        return await m.answer('Формат: /delpromo HELLO10')
+        return await m.answer('Пример: /delpromo КОД')
     with db() as con:
         con.execute('UPDATE promocodes SET active=0 WHERE code=?', (args[1].upper(),))
     await m.answer('✅ Промокод отключён.')
@@ -334,7 +343,7 @@ async def discount(m: Message):
     try:
         uid = int((m.text or '').split()[1])
     except (IndexError, ValueError):
-        return await m.answer('Формат: /discount ID')
+        return await m.answer('Укажите идентификатор пользователя: /discount 123456789')
     with db() as con:
         u = con.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
         p = con.execute('SELECT COUNT(*) AS n FROM promo_uses WHERE user_id=?', (uid,)).fetchone()['n']
@@ -348,7 +357,7 @@ async def cleardiscount(m: Message):
     try:
         uid = int((m.text or '').split()[1])
     except (IndexError, ValueError):
-        return await m.answer('Формат: /cleardiscount ID')
+        return await m.answer('Укажите идентификатор пользователя: /cleardiscount 123456789')
     with db() as con:
         con.execute('UPDATE users SET discount=0 WHERE id=?', (uid,))
         con.execute('DELETE FROM promo_uses WHERE user_id=?', (uid,))
@@ -406,7 +415,7 @@ async def manage_ban(m: Message):
         if uid <= 0 or uid == ADMIN_ID:
             raise ValueError
     except (IndexError, ValueError):
-        return await m.answer('Укажите корректный Telegram ID пользователя.')
+        return await m.answer('Укажите правильный числовой идентификатор пользователя.')
     command = args[0].split('@')[0]
     with db() as con:
         if command == '/ban':
@@ -448,9 +457,11 @@ async def text_handler(m: Message):
             code = (m.text or '').strip().upper()
             promo = con.execute('SELECT * FROM promocodes WHERE code=? AND active=1 AND uses_left>0', (code,)).fetchone()
             used = con.execute('SELECT 1 FROM promo_uses WHERE user_id=?', (m.from_user.id,)).fetchone()
-            if not promo or used:
+            old = con.execute('SELECT 1 FROM promo_history WHERE user_id=? AND code=?', (m.from_user.id,code)).fetchone()
+            if not promo or used or old:
                 return await m.answer('Промокод недействителен либо у вас уже есть активный промокод.')
             con.execute('INSERT INTO promo_uses(user_id,code) VALUES (?,?)', (m.from_user.id, code))
+            con.execute('INSERT INTO promo_history(user_id,code) VALUES (?,?)', (m.from_user.id, code))
             con.execute('UPDATE promocodes SET uses_left=uses_left-1 WHERE code=?', (code,))
             con.execute('DELETE FROM pending WHERE user_id=?', (m.from_user.id,))
             return await m.answer('🎉 Промокод активирован! Скидка 10% на обычные товары. '
@@ -474,18 +485,18 @@ async def text_handler(m: Message):
             try:
                 con.execute('INSERT INTO categories(name) VALUES (?)', (value,))
             except sqlite3.IntegrityError:
-                return await m.answer('Такая категория уже существует. Введи другое название.')
+                return await m.answer('Такая категория уже существует. Укажите другое название.')
             reply = '✅ Категория добавлена!'
         elif state['action'] == 'product':
             con.execute('INSERT INTO products(category_id, name, quantity) VALUES (?, ?, 0)', (state['category_id'], value))
-            reply = '✅ Товар добавлен! Теперь установи количество через /admin.'
+            reply = '✅ Товар добавлен! Количество товара можно указать в панели администратора.'
         else:
             try:
                 qty = int(value)
                 if qty < 0 or qty > 1000000:
                     raise ValueError
             except ValueError:
-                return await m.answer('Введи целое число от 0 до 1000000.')
+                return await m.answer('Введите целое число от 0 до 1 000 000.')
             con.execute('UPDATE products SET quantity=? WHERE id=?', (qty, state['category_id']))
             reply = '✅ Количество обновлено!'
         con.execute('DELETE FROM pending WHERE user_id=?', (m.from_user.id,))
@@ -499,7 +510,11 @@ async def main():
     if not token:
         raise SystemExit('BOT_TOKEN не задан')
     init()
-    await DP.start_polling(Bot(token=token))
+    bot = Bot(token=token)
+    await bot.set_my_commands([BotCommand(command='start', description='Главное меню'),
+                               BotCommand(command='purchase', description='Заявка на покупку'),
+                               BotCommand(command='cancel', description='Отменить ввод')])
+    await DP.start_polling(bot)
 
 if __name__ == '__main__':
     asyncio.run(main())
