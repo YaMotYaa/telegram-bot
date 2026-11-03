@@ -3,6 +3,7 @@ import logging
 import os
 import sqlite3
 import secrets
+import html
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,14 @@ def init():
         con.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, username TEXT, invited_by INTEGER, referrals INTEGER NOT NULL DEFAULT 0, discount INTEGER NOT NULL DEFAULT 0, joined_at TEXT NOT NULL)')
         con.execute('CREATE TABLE IF NOT EXISTS promocodes (code TEXT PRIMARY KEY, uses_left INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1)')
         con.execute('CREATE TABLE IF NOT EXISTS promo_uses (user_id INTEGER, code TEXT, PRIMARY KEY(user_id,code))')
+        con.execute('DELETE FROM promo_uses WHERE rowid NOT IN (SELECT MIN(rowid) FROM promo_uses GROUP BY user_id)')
+        con.execute('CREATE UNIQUE INDEX IF NOT EXISTS one_promo_per_user ON promo_uses(user_id)')
+        cols = {r['name'] for r in con.execute('PRAGMA table_info(products)')}
+        if 'description' not in cols:
+            con.execute("ALTER TABLE products ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if 'photo_id' not in cols:
+            con.execute("ALTER TABLE products ADD COLUMN photo_id TEXT")
+        con.execute('CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL)')
         con.execute('CREATE TABLE IF NOT EXISTS purchases (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT "pending", created_at TEXT NOT NULL)')
 
 
@@ -57,13 +66,14 @@ def admin_menu():
                      ('🎟 Промокоды', 'adminpromos'),
                      ('👥 Скидки пользователей', 'admindiscounts'),
                      ('🧾 Подтверждение покупок', 'adminorders'),
+                     ('🚫 Бан пользователей', 'adminbans'),
                      ('🏠 Главное меню', 'home')])
 
 
 def profile_keyboard():
     return keyboard([('🔗 Моя реферальная ссылка', 'referral'),
                      ('🎟 Активировать промокод', 'redeem'),
-                     ('🏠 Главное меню', 'home')])
+                     ('⬅️ Главное меню', 'home')])
 
 
 def profile_text(uid):
@@ -72,13 +82,45 @@ def profile_text(uid):
         promos = con.execute('SELECT COUNT(*) AS n FROM promo_uses WHERE user_id=?', (uid,)).fetchone()['n']
     if not u:
         return 'Профиль пока не создан. Нажми /start.'
-    return (f"👤 Твой уютный профиль ✨\\n\\n"
-            f"🌟 Имя: {u['name']}\\n"
-            f"🆔 ID: {uid}\\n"
-            f"👯 Приглашено друзей: {u['referrals']}\\n"
-            f"🎁 Реферальная скидка: {'10%' if u['discount'] else 'нет'}\\n"
-            f"🎟 Активных промокодов: {promos}\\n"
-            f"💡 Общая скидка не превышает 10%.")
+    return (f"👤 Ваш профиль\\n\\n"
+            f"Имя: {html.escape(u['name'] or 'Не указано')}\\n"
+            f"Telegram ID: {uid}\\n"
+            f"Приглашено друзей: {u['referrals']}\\n"
+            f"Реферальная скидка: {'10%' if u['discount'] else 'нет'}\\n"
+            f"Активный промокод: {'есть' if promos else 'нет'}\\n"
+            f"Максимальная скидка: 10%.")
+
+
+def is_banned(uid):
+    with db() as con:
+        return con.execute('SELECT 1 FROM bans WHERE user_id=?', (uid,)).fetchone() is not None
+
+
+def product_buttons(p, admin):
+    pid = p['id']
+    back = f"manage:{p['category_id']}" if admin else f"category:{p['category_id']}"
+    if not admin:
+        return keyboard([('⬅️ Назад', back)])
+    return keyboard([('📝 Изменить описание', f'desc:{pid}'),
+                     ('📷 Добавить / заменить фото', f'photo:{pid}'),
+                     ('🗑 Удалить фото', f'removephoto:{pid}'),
+                     ('✏️ Изменить количество', f'setqty:{pid}'),
+                     ('🗑 Удалить товар', f'delproduct:{pid}'),
+                     ('⬅️ Назад', back)])
+
+
+def product_caption(p):
+    return (f"{p['name']}\\n"
+            f"{'В наличии' if p['quantity'] else 'Нет в наличии'}\\n"
+            f"Количество: {p['quantity']} шт.\\n\\n"
+            f"Описание: {p['description'] or 'Не добавлено'}")
+
+
+async def show_product(c, p, admin):
+    # Фото отправляется отдельным сообщением; кнопки остаются у карточки.
+    await c.message.edit_text(product_caption(p), reply_markup=product_buttons(p, admin))
+    if p['photo_id']:
+        await c.message.answer_photo(p['photo_id'], caption=f"Фото товара: {p['name']}")
 
 
 def home():
@@ -113,6 +155,8 @@ async def start(m: Message):
             inviter = int(parts[1][4:])
         except ValueError:
             pass
+    if is_banned(m.from_user.id):
+        return await m.answer('Доступ к боту ограничен.')
     register_user(m.from_user, inviter)
     await m.answer('Добро пожаловать! Выберите раздел:', reply_markup=home())
 
@@ -130,91 +174,116 @@ async def admin(m: Message):
 async def callback(c: CallbackQuery):
     data = c.data or ''
     uid = c.from_user.id
+    if uid != ADMIN_ID and is_banned(uid):
+        return await c.answer('Доступ к боту ограничен.', show_alert=True)
     register_user(c.from_user)
-    admin_action = data in ('admin','admincats','addcat','adminpromos','admindiscounts','adminorders') or data.startswith(('manage:', 'addproduct:', 'editproduct:', 'setqty:', 'delproduct:', 'delcat:'))
+    admin_action = data in ('admin','admincats','addcat','adminpromos','admindiscounts','adminorders','adminbans') or data.startswith(('manage:', 'addproduct:', 'editproduct:', 'setqty:', 'delproduct:', 'delcat:', 'desc:', 'photo:', 'removephoto:'))
     if admin_action and uid != ADMIN_ID:
         return await c.answer('Нет доступа', show_alert=True)
+    if data in ('home', 'profile', 'admin', 'catalog', 'admincats') or data.startswith(('editproduct:', 'manage:', 'category:')):
+        with db() as con:
+            con.execute('DELETE FROM pending WHERE user_id=?', (uid,))
     if data == 'home':
-        await c.message.answer('Главное меню:', reply_markup=home())
+        await c.message.edit_text('Главное меню:', reply_markup=home())
     elif data == 'catalog':
-        await c.message.answer('📦 Выберите категорию:', reply_markup=categories())
+        await c.message.edit_text('📦 Выберите категорию:', reply_markup=categories())
     elif data == 'admin':
-        await c.message.answer('⚙️ Админка:', reply_markup=admin_menu())
+        await c.message.edit_text('⚙️ Админка:', reply_markup=admin_menu())
     elif data == 'admincats':
-        await c.message.answer('⚙️ Категории:', reply_markup=categories(True))
+        await c.message.edit_text('⚙️ Категории:', reply_markup=categories(True))
     elif data.startswith(('category:', 'manage:')):
         catid = int(data.split(':')[1]); is_admin = data.startswith('manage:')
         with db() as con:
             row = con.execute('SELECT name FROM categories WHERE id=?', (catid,)).fetchone()
         if row:
-            await c.message.answer(f"📦 {row['name']}", reply_markup=products(catid, is_admin))
+            await c.message.edit_text(f"📦 {row['name']}", reply_markup=products(catid, is_admin))
     elif data == 'addcat':
         with db() as con:
             con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, NULL)', (uid, 'category'))
-        await c.message.answer('Напиши название новой категории. Отмена: /cancel')
+        await c.message.edit_text('Напиши название новой категории. Отмена: /cancel')
     elif data.startswith('addproduct:'):
         catid = int(data.split(':')[1])
         with db() as con:
             con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, ?)', (uid, 'product', catid))
-        await c.message.answer('Напиши название товара. Отмена: /cancel')
+        await c.message.edit_text('Напиши название товара. Отмена: /cancel')
     elif data.startswith(('product:', 'editproduct:')):
         pid = int(data.split(':')[1]); is_admin = data.startswith('editproduct:')
         with db() as con:
             p = con.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
         if p:
-            msg = f"{p['name']}\n{'✅ В наличии' if p['quantity'] else '❌ Нет в наличии'}\nКоличество: {p['quantity']} шт."
-            if is_admin:
-                kb = keyboard([('✏️ Изменить количество', f'setqty:{pid}'), ('🗑 Удалить товар', f'delproduct:{pid}'), ('⬅️ Назад', f"manage:{p['category_id']}")])
-            else:
-                kb = keyboard([('⬅️ Назад', f"category:{p['category_id']}")])
-            await c.message.answer(msg, reply_markup=kb)
+            await show_product(c, p, is_admin)
+    elif data.startswith(('desc:', 'photo:')):
+        pid = int(data.split(':')[1])
+        with db() as con:
+            p = con.execute('SELECT id FROM products WHERE id=?', (pid,)).fetchone()
+            if p:
+                con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, ?)',
+                            (uid, 'description' if data.startswith('desc:') else 'photo', pid))
+        if p:
+            await c.message.edit_text(
+                'Отправьте текст описания (до 1000 символов).' if data.startswith('desc:')
+                else 'Отправьте одну фотографию товара.',
+                reply_markup=keyboard([('⬅️ Назад', f'editproduct:{pid}')]))
+    elif data.startswith('removephoto:'):
+        pid = int(data.split(':')[1])
+        with db() as con:
+            con.execute('UPDATE products SET photo_id=NULL WHERE id=?', (pid,))
+            p = con.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
+        if p:
+            await show_product(c, p, True)
+    elif data == 'adminbans':
+        await c.message.edit_text('🚫 Управление доступом\\n\\n'
+                                  'Заблокировать: /ban ID\\n'
+                                  'Разблокировать: /unban ID\\n'
+                                  'Проверить: /banstatus ID',
+                                  reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data.startswith('setqty:'):
         pid = int(data.split(':')[1])
         with db() as con:
             con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, ?)', (uid, 'quantity', pid))
-        await c.message.answer('Введи количество (0 = нет в наличии). Отмена: /cancel')
+        await c.message.edit_text('Введи количество (0 = нет в наличии). Отмена: /cancel')
     elif data.startswith('delproduct:'):
         pid = int(data.split(':')[1])
         with db() as con:
             p = con.execute('SELECT category_id FROM products WHERE id=?', (pid,)).fetchone()
             if p:
                 con.execute('DELETE FROM products WHERE id=?', (pid,))
-        await c.message.answer('✅ Товар удалён.', reply_markup=products(p['category_id'], True) if p else categories(True))
+        await c.message.edit_text('✅ Товар удалён.', reply_markup=products(p['category_id'], True) if p else categories(True))
     elif data.startswith('delcat:'):
         catid = int(data.split(':')[1])
         with db() as con:
             con.execute('DELETE FROM products WHERE category_id=?', (catid,))
             con.execute('DELETE FROM categories WHERE id=?', (catid,))
-        await c.message.answer('✅ Категория и её товары удалены.', reply_markup=categories(True))
+        await c.message.edit_text('✅ Категория и её товары удалены.', reply_markup=categories(True))
     elif data == 'profile':
-        await c.message.answer(profile_text(uid), reply_markup=profile_keyboard())
+        await c.message.edit_text(profile_text(uid), reply_markup=profile_keyboard())
     elif data == 'referral':
         me = await c.bot.get_me()
         link = f'https://t.me/{me.username}?start=ref_{uid}'
-        await c.message.answer('💌 Твоя личная ссылка для друзей:\\n' + link +
-                               '\\n\\nЗа каждого нового друга — скидка 10% на обычные товары. '
+        await c.message.edit_text('💌 Твоя личная ссылка для друзей:\n' + link +
+                               '\n\nЗа каждого нового друга — скидка 10% на обычные товары. '
                                'Скидка не суммируется и списывается только после подтверждения покупки.',
-                               reply_markup=profile_keyboard())
+                               reply_markup=keyboard([('⬅️ Назад', 'profile')]))
     elif data == 'redeem':
         with db() as con:
             con.execute('INSERT OR REPLACE INTO pending VALUES (?, ?, NULL)', (uid, 'redeem'))
-        await c.message.answer('🎟 Напиши свой промокод одним сообщением. Отмена: /cancel')
+        await c.message.edit_text('Введите промокод одним сообщением.', reply_markup=keyboard([('⬅️ Назад', 'profile')]))
     elif data == 'adminpromos':
-        await c.message.answer('🎟 Создать промокод: /newpromo КОД КОЛИЧЕСТВО\\n'
-                               'Отключить: /delpromo КОД\\n'
-                               'Промокод даёт скидку 10% на обычные товары.')
+        await c.message.edit_text('🎟 Создать промокод: /newpromo КОД КОЛИЧЕСТВО\n'
+                               'Отключить: /delpromo КОД\n'
+                               'Промокод даёт скидку 10% на обычные товары.', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data == 'admindiscounts':
-        await c.message.answer('👥 Проверить скидку: /discount ID\\n'
-                               'Удалить скидку: /cleardiscount ID')
+        await c.message.edit_text('👥 Проверить скидку: /discount ID\n'
+                               'Удалить скидку: /cleardiscount ID', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data == 'adminorders':
         with db() as con:
             orders = con.execute("SELECT id,user_id FROM purchases WHERE status='pending' ORDER BY id DESC LIMIT 15").fetchall()
-        msg = '🧾 Ожидают подтверждения:\\n' + ('\\n'.join(f"#{o['id']} — пользователь {o['user_id']}" for o in orders) if orders else 'Пока пусто')
-        await c.message.answer(msg + '\\n\\nПодтвердить: /confirm НОМЕР\\nОтменить: /reject НОМЕР')
+        msg = '🧾 Ожидают подтверждения:\n' + ('\n'.join(f"#{o['id']} — пользователь {o['user_id']}" for o in orders) if orders else 'Пока пусто')
+        await c.message.edit_text(msg + '\n\nПодтвердить: /confirm НОМЕР\nОтменить: /reject НОМЕР', reply_markup=keyboard([('⬅️ Назад', 'admin')]))
     elif data == 'support':
-        await c.message.answer('💖 Приветик! Если что-то непонятно, возник вопросик или нужна помощь — не стесняйся, просто напиши @nikotinmal 💌\\nМы постараемся помочь! ✨', reply_markup=home())
+        await c.message.edit_text('💬 Поддержка\n\nПо вопросам работы каталога и наличия товаров обращайтесь к администратору: @nikotinmal.\n\nМы ответим на ваше сообщение при первой возможности.', reply_markup=keyboard([('⬅️ Назад', 'home')]))
     elif data == 'info':
-        await c.message.answer('ℹ️ Здесь можно посмотреть актуальное наличие товаров.', reply_markup=home())
+        await c.message.edit_text('ℹ️ Здесь можно посмотреть актуальное наличие товаров.', reply_markup=keyboard([('⬅️ Назад', 'home')]))
     await c.answer()
 
 @DP.message(Command('cancel'))
@@ -228,12 +297,22 @@ async def newpromo(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
     args = (m.text or '').split()
-    if len(args) != 3 or not re.fullmatch(r'[A-Za-z0-9_-]{3,24}', args[1]) or not args[2].isdigit() or not 1 <= int(args[2]) <= 100000:
-        return await m.answer('Формат: /newpromo HELLO10 20')
+    if len(args) == 1:
+        code = 'GIFT-' + secrets.token_hex(4).upper()
+        uses = 1
+    elif len(args) == 3 and re.fullmatch(r'[A-Za-z0-9_-]{3,24}', args[1]) and args[2].isdigit() and 1 <= int(args[2]) <= 100000:
+        code, uses = args[1].upper(), int(args[2])
+    else:
+        return await m.answer('Создать один уникальный промокод: /newpromo\\nИли: /newpromo КОД 1')
     with db() as con:
-        con.execute('INSERT OR REPLACE INTO promocodes(code,uses_left,active) VALUES (?,?,1)',
-                    (args[1].upper(), int(args[2])))
-    await m.answer('✅ Промокод создан (скидка 10%).')
+        existing = con.execute('SELECT 1 FROM promocodes WHERE code=?', (code,)).fetchone()
+        if existing:
+            return await m.answer('Такой код уже существует. Выберите другой.')
+        con.execute('INSERT INTO promocodes(code,uses_left,active) VALUES (?,?,1)', (code, uses))
+    await m.answer('Промокод создан. Нажмите на код, чтобы скопировать:\\n'
+                   f'<code>{html.escape(code)}</code>\\n'
+                   f'Активаций: {uses}\\nСкидка: 10%.',
+                   parse_mode='HTML')
 
 
 @DP.message(Command('delpromo'))
@@ -278,6 +357,8 @@ async def cleardiscount(m: Message):
 
 @DP.message(Command('purchase'))
 async def purchase(m: Message):
+    if is_banned(m.from_user.id):
+        return await m.answer('Доступ к боту ограничен.')
     register_user(m.from_user)
     with db() as con:
         active = con.execute('SELECT 1 FROM purchases WHERE user_id=? AND status="pending"', (m.from_user.id,)).fetchone()
@@ -287,7 +368,7 @@ async def purchase(m: Message):
                           (m.from_user.id, datetime.now(timezone.utc).isoformat()))
         oid = cur.lastrowid
     await m.answer(f'🧾 Заявка #{oid} создана. Скидка пока не списана.')
-    await m.bot.send_message(ADMIN_ID, f'🧾 Новая заявка #{oid} от {m.from_user.id}\\nПодтвердить: /confirm {oid}\\nОтклонить: /reject {oid}')
+    await m.bot.send_message(ADMIN_ID, f'🧾 Новая заявка #{oid} от {m.from_user.id}\nПодтвердить: /confirm {oid}\nОтклонить: /reject {oid}')
 
 
 @DP.message(Command('confirm', 'reject'))
@@ -315,8 +396,49 @@ async def order_action(m: Message):
         logging.exception('Не удалось уведомить пользователя')
 
 
+@DP.message(Command('ban', 'unban', 'banstatus'))
+async def manage_ban(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    args = (m.text or '').split()
+    try:
+        uid = int(args[1])
+        if uid <= 0 or uid == ADMIN_ID:
+            raise ValueError
+    except (IndexError, ValueError):
+        return await m.answer('Укажите корректный Telegram ID пользователя.')
+    command = args[0].split('@')[0]
+    with db() as con:
+        if command == '/ban':
+            con.execute('INSERT OR IGNORE INTO bans VALUES (?,?)',
+                        (uid, datetime.now(timezone.utc).isoformat()))
+            response = 'Пользователь заблокирован.'
+        elif command == '/unban':
+            con.execute('DELETE FROM bans WHERE user_id=?', (uid,))
+            response = 'Пользователь разблокирован.'
+        else:
+            response = ('Заблокирован.' if con.execute('SELECT 1 FROM bans WHERE user_id=?', (uid,)).fetchone() else 'Не заблокирован.')
+    await m.answer(f'{uid}: {response}')
+
+
+@DP.message(F.photo)
+async def photo_handler(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    with db() as con:
+        state = con.execute('SELECT * FROM pending WHERE user_id=?', (m.from_user.id,)).fetchone()
+        if not state or state['action'] != 'photo':
+            return await m.answer('Сначала откройте товар в админке и нажмите «Добавить фото».')
+        pid = state['category_id']
+        con.execute('UPDATE products SET photo_id=? WHERE id=?', (m.photo[-1].file_id, pid))
+        con.execute('DELETE FROM pending WHERE user_id=?', (m.from_user.id,))
+    await m.answer('Фотография сохранена.', reply_markup=keyboard([('⬅️ К товару', f'editproduct:{pid}')]))
+
+
 @DP.message(F.text)
 async def text_handler(m: Message):
+    if m.from_user.id != ADMIN_ID and is_banned(m.from_user.id):
+        return await m.answer('Доступ к боту ограничен.')
     register_user(m.from_user)
     with db() as con:
         state = con.execute('SELECT * FROM pending WHERE user_id=?', (m.from_user.id,)).fetchone()
@@ -325,18 +447,27 @@ async def text_handler(m: Message):
         if state['action'] == 'redeem':
             code = (m.text or '').strip().upper()
             promo = con.execute('SELECT * FROM promocodes WHERE code=? AND active=1 AND uses_left>0', (code,)).fetchone()
-            used = con.execute('SELECT 1 FROM promo_uses WHERE user_id=? AND code=?', (m.from_user.id, code)).fetchone()
+            used = con.execute('SELECT 1 FROM promo_uses WHERE user_id=?', (m.from_user.id,)).fetchone()
             if not promo or used:
-                return await m.answer('😿 Промокод недействителен или уже использован.')
+                return await m.answer('Промокод недействителен либо у вас уже есть активный промокод.')
             con.execute('INSERT INTO promo_uses(user_id,code) VALUES (?,?)', (m.from_user.id, code))
             con.execute('UPDATE promocodes SET uses_left=uses_left-1 WHERE code=?', (code,))
             con.execute('DELETE FROM pending WHERE user_id=?', (m.from_user.id,))
             return await m.answer('🎉 Промокод активирован! Скидка 10% на обычные товары. '
                                   'Она не суммируется с реферальной и списывается после подтверждения покупки.',
-                                  reply_markup=profile_keyboard())
+                                  reply_markup=keyboard([('⬅️ Назад', 'profile')]))
         if m.from_user.id != ADMIN_ID:
             return
         value = m.text.strip()
+        if state['action'] == 'description':
+            if len(value) > 1000:
+                return await m.answer('Описание не должно превышать 1000 символов.')
+            pid = state['category_id']
+            con.execute('UPDATE products SET description=? WHERE id=?', (value, pid))
+            con.execute('DELETE FROM pending WHERE user_id=?', (m.from_user.id,))
+            return await m.answer('Описание сохранено.', reply_markup=keyboard([('⬅️ К товару', f'editproduct:{pid}')]))
+        if state['action'] == 'photo':
+            return await m.answer('Отправьте фотографию, а не текст.')
         if not value or len(value) > 100:
             return await m.answer('Введите текст от 1 до 100 символов.')
         if state['action'] == 'category':
